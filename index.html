@@ -1252,114 +1252,112 @@ var _AUDIO_BEEP  = "data:audio/mp3;base64,SUQzBAAAAAABAFRYWFgAAAASAAADbWFqb3JfYn
 // listo y en estado "running" cuando se necesite.
 
 // ── AUDIO ENGINE ─────────────────────────────────────────────────
-// Usa Web Audio API + decodeAudioData: funciona en file:// y https://
 var _audioCtx = null;
 var _bufVoice = null;
 var _bufBeep  = null;
+var _audioUnlocked = false;
 
-// Obtiene o crea el AudioContext (siempre dentro de un gesto de usuario)
-function _getCtx(){
-  if(!_audioCtx){
-    try{ _audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }
-    catch(e){ return null; }
-  }
-  return _audioCtx;
-}
-
-// Convierte data:audio/mp3;base64,XXX → ArrayBuffer
 function _b64ToArrayBuffer(dataUrl){
-  var b64 = dataUrl.split(',')[1];
-  var bin = atob(b64);
-  var buf = new ArrayBuffer(bin.length);
-  var view = new Uint8Array(buf);
+  var b64=dataUrl.split(',')[1], bin=atob(b64);
+  var buf=new ArrayBuffer(bin.length), view=new Uint8Array(buf);
   for(var i=0;i<bin.length;i++) view[i]=bin.charCodeAt(i);
   return buf;
 }
 
-// Decodifica un audio base64 en el AudioContext dado → Promise<AudioBuffer>
-function _decode(ctx, dataUrl){
-  return new Promise(function(resolve, reject){
-    var ab = _b64ToArrayBuffer(dataUrl);
-    ctx.decodeAudioData(ab, resolve, reject);
-  });
+// Paso 1: desbloquear AudioContext + decodificar buffers
+// Llamar en el PRIMER click — no produce sonido, solo prepara
+function _unlockAndDecode(){
+  if(_audioUnlocked) return;
+  try{
+    _audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    // Reproducir silencio para desbloquear
+    var silent = _audioCtx.createBuffer(1,1,22050);
+    var s = _audioCtx.createBufferSource();
+    s.buffer=silent; s.connect(_audioCtx.destination); s.start(0);
+    _audioUnlocked = true;
+    console.log('[Audio] desbloqueado, estado:', _audioCtx.state);
+    // Decodificar los dos buffers inmediatamente
+    var ab1 = _b64ToArrayBuffer(_AUDIO_VOICE);
+    var ab2 = _b64ToArrayBuffer(_AUDIO_BEEP);
+    _audioCtx.decodeAudioData(ab1, function(b){ _bufVoice=b; console.log('[Audio] voz lista, dur:',b.duration.toFixed(2)+'s'); });
+    _audioCtx.decodeAudioData(ab2, function(b){ _bufBeep=b;  console.log('[Audio] beep listo, dur:',b.duration.toFixed(2)+'s'); });
+  }catch(e){ console.warn('[Audio] unlock falló:',e); }
 }
 
-// Reproduce un AudioBuffer → Promise que resuelve cuando termina
-function _playBuf(ctx, buf){
+// Paso 2: reproducir (llamar en click posterior, buffers ya listos)
+function _playBufNow(buf){
   return new Promise(function(resolve){
-    var src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(ctx.destination);
-    src.onended = resolve;
-    setTimeout(resolve, (buf.duration + 0.5) * 1000); // failsafe
+    if(!_audioCtx||!buf){resolve();return;}
+    if(_audioCtx.state==='suspended'){
+      _audioCtx.resume();
+    }
+    var src=_audioCtx.createBufferSource();
+    src.buffer=buf;
+    src.connect(_audioCtx.destination);
+    src.onended=resolve;
+    setTimeout(resolve,(buf.duration+0.3)*1000);
     src.start(0);
   });
 }
 
-// Generador de tono sintético (fallback si los MP3 fallan)
-function _tone(ctx, freq, type, vol, start, dur){
-  var o=ctx.createOscillator(), g=ctx.createGain();
-  o.connect(g); g.connect(ctx.destination);
-  o.type=type; o.frequency.value=freq;
-  g.gain.setValueAtTime(0,start);
-  g.gain.linearRampToValueAtTime(vol,start+0.01);
-  g.gain.setValueAtTime(vol,start+Math.max(dur-0.05,0.01));
-  g.gain.linearRampToValueAtTime(0,start+dur);
-  o.start(start); o.stop(start+dur+0.02);
-}
-function _syntheticBeep(ctx){
-  var t=ctx.currentTime+0.02;
-  _tone(ctx,900,'square',0.5,t,0.5);
-  _tone(ctx,1800,'sine',0.15,t,0.45);
+function _syntheticBeep(){
+  if(!_audioCtx) return;
+  var t=_audioCtx.currentTime+0.02;
+  function tone(f,tp,v,st,d){
+    var o=_audioCtx.createOscillator(),g=_audioCtx.createGain();
+    o.connect(g);g.connect(_audioCtx.destination);
+    o.type=tp;o.frequency.value=f;
+    g.gain.setValueAtTime(0,st);g.gain.linearRampToValueAtTime(v,st+0.01);
+    g.gain.setValueAtTime(v,st+Math.max(d-0.05,0.01));g.gain.linearRampToValueAtTime(0,st+d);
+    o.start(st);o.stop(st+d+0.02);
+  }
+  tone(900,'square',0.5,t,0.5); tone(1800,'sine',0.15,t,0.45);
 }
 
-// Secuencia principal: voz → pausa → pitido
-// DEBE llamarse dentro del handler del click (mismo gesto de usuario)
+// Secuencia completa
 function _playRaceSequence(){
   return new Promise(function(resolve){
-    // 1. Crear/obtener AudioContext dentro del gesto
-    var ctx = _getCtx();
-    if(!ctx){ resolve(); return; }
+    if(!_audioUnlocked || !_audioCtx){ resolve(); return; }
+    if(_audioCtx.state==='suspended'){ _audioCtx.resume(); }
 
-    // 2. Resumir si está suspendido (Chrome lo suspende en file://)
-    var doPlay = function(){
-      if(_bufVoice && _bufBeep){
-        // Buffers ya decodificados → reproducir directo
-        _playBuf(ctx, _bufVoice).then(function(){
-          setTimeout(function(){ _playBuf(ctx, _bufBeep).then(resolve); }, 220);
-        });
-      } else {
-        // Decodificar en el momento
-        console.log('[Audio] decodificando buffers...');
-        Promise.all([
-          _decode(ctx, _AUDIO_VOICE),
-          _decode(ctx, _AUDIO_BEEP)
-        ]).then(function(bufs){
-          _bufVoice = bufs[0]; _bufBeep = bufs[1];
-          console.log('[Audio] buffers OK, reproduciendo');
-          _playBuf(ctx, _bufVoice).then(function(){
-            setTimeout(function(){ _playBuf(ctx, _bufBeep).then(resolve); }, 220);
-          });
-        }).catch(function(e){
-          console.warn('[Audio] decode falló, usando tono sintético:', e);
-          _syntheticBeep(ctx);
-          setTimeout(resolve, 700);
-        });
-      }
-    };
-
-    if(ctx.state === 'suspended'){
-      ctx.resume().then(doPlay).catch(function(){ doPlay(); });
+    if(_bufVoice && _bufBeep){
+      console.log('[Audio] reproduciendo voz+beep');
+      _playBufNow(_bufVoice).then(function(){
+        setTimeout(function(){ _playBufNow(_bufBeep).then(resolve); }, 220);
+      });
     } else {
-      doPlay();
+      console.warn('[Audio] buffers no listos, usando tono sintético');
+      _syntheticBeep();
+      setTimeout(resolve, 700);
     }
   });
 }
 
+// Botón test: primer click desbloquea y decodifica,
+// segundo click reproduce (con mensaje de guía)
+var _testClickCount = 0;
 function testRaceAudio(){
-  console.log('[Audio] testRaceAudio llamado');
-  _playRaceSequence();
+  _testClickCount++;
+  if(_testClickCount === 1){
+    _unlockAndDecode();
+    // Mostrar feedback visual en el botón
+    var btn = document.getElementById('btn-test-audio');
+    if(btn){ btn.textContent='🔊 Presioná de nuevo'; btn.style.borderColor='var(--gb)'; btn.style.color='var(--gt)'; }
+    console.log('[Audio] 1er click: desbloqueando. Presioná de nuevo para escuchar.');
+  } else {
+    console.log('[Audio] reproduciendo...');
+    _unlockAndDecode(); // por si acaso
+    _playRaceSequence().then(function(){
+      var btn=document.getElementById('btn-test-audio');
+      if(btn){ btn.textContent='🔊 Test audio partida'; btn.style.borderColor=''; btn.style.color='var(--at)'; }
+      _testClickCount=0;
+    });
+  }
 }
+
+// Desbloquear automáticamente en el primer gesto en cualquier parte
+document.addEventListener('click', function(){ _unlockAndDecode(); }, {once:true});
+document.addEventListener('touchstart', function(){ _unlockAndDecode(); }, {once:true, passive:true});
 
 // ── Chequea si el bloque es 25m con partida ──────────────────
 function blockIs25mConPartida(b){
